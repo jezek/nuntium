@@ -24,20 +24,24 @@ package storage
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
 	"path"
 
+	"github.com/ubports/nuntium/mms"
 	"launchpad.net/go-xdg/v0"
 )
 
 const SUBPATH = "nuntium/store"
 
-func Create(uuid, contentLocation string) error {
+func Create(mNotificationInd *mms.MNotificationInd) error {
 	state := MMSState{
-		State:           NOTIFICATION,
-		ContentLocation: contentLocation,
+		State:            NOTIFICATION,
+		ContentLocation:  mNotificationInd.ContentLocation, //TODO:jezek remove location, it is not used anywhere and the loc. is stored in MNotificationInd anyway.
+		MNotificationInd: mNotificationInd,
 	}
-	storePath, err := xdg.Data.Ensure(path.Join(SUBPATH, uuid+".db"))
+	storePath, err := xdg.Data.Ensure(path.Join(SUBPATH, mNotificationInd.UUID+".db"))
 	if err != nil {
 		return err
 	}
@@ -45,6 +49,11 @@ func Create(uuid, contentLocation string) error {
 }
 
 func Destroy(uuid string) error {
+	mmsState, err := GetMMSState(uuid)
+	if err != nil {
+		return fmt.Errorf("Error getting MMS state: %w", err)
+	}
+
 	if storePath, err := xdg.Data.Ensure(path.Join(SUBPATH, uuid+".db")); err == nil {
 		if err := os.Remove(storePath); err != nil {
 			return err
@@ -52,6 +61,11 @@ func Destroy(uuid string) error {
 	} else {
 		return err
 	}
+
+	if mmsState.State == NOTIFICATION {
+		return nil
+	}
+
 	if mmsPath, err := GetMMS(uuid); err == nil {
 		if err := os.Remove(mmsPath); err != nil {
 			return err
@@ -121,6 +135,42 @@ func CreateSendFile(uuid string) (*os.File, error) {
 
 func GetMMS(uuid string) (string, error) {
 	return xdg.Data.Find(path.Join(SUBPATH, uuid+".mms"))
+}
+
+// Gets MMSState from strorage stored under uuid.
+func GetMMSState(uuid string) (MMSState, error) {
+	mmsState := MMSState{}
+	storePath, err := xdg.Data.Find(path.Join(SUBPATH, uuid+".db"))
+	if err != nil {
+		return mmsState, err
+	}
+
+	f, err := os.Open(storePath)
+	if err != nil {
+		return MMSState{}, err
+	}
+	defer f.Close()
+
+	jsonReader := json.NewDecoder(f)
+	if err := jsonReader.Decode(&mmsState); err != nil {
+		return mmsState, err
+	}
+
+	return mmsState, nil
+}
+func GetMNotificationInd(uuid string) *mms.MNotificationInd {
+	mmsState, err := GetMMSState(uuid)
+	if err != nil {
+		log.Print("MMS state retrieving error:", err)
+		return nil
+	}
+
+	if mmsState.State != NOTIFICATION {
+		log.Print("MMS was already downloaded")
+		return nil
+	}
+
+	return mmsState.MNotificationInd
 }
 
 func writeState(state MMSState, storePath string) error {

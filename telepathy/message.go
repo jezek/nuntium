@@ -37,20 +37,22 @@ func init() {
 }
 
 type MessageInterface struct {
-	conn       *dbus.Connection
-	objectPath dbus.ObjectPath
-	msgChan    chan *dbus.Message
-	deleteChan chan dbus.ObjectPath
-	status     string
+	conn           *dbus.Connection
+	objectPath     dbus.ObjectPath
+	msgChan        chan *dbus.Message
+	deleteChan     chan dbus.ObjectPath
+	redownloadChan chan dbus.ObjectPath
+	status         string
 }
 
-func NewMessageInterface(conn *dbus.Connection, objectPath dbus.ObjectPath, deleteChan chan dbus.ObjectPath) *MessageInterface {
+func NewMessageInterface(conn *dbus.Connection, objectPath dbus.ObjectPath, deleteChan chan dbus.ObjectPath, redownloadChan chan dbus.ObjectPath) *MessageInterface {
 	msgInterface := MessageInterface{
-		conn:       conn,
-		objectPath: objectPath,
-		deleteChan: deleteChan,
-		msgChan:    make(chan *dbus.Message),
-		status:     "draft",
+		conn:           conn,
+		objectPath:     objectPath,
+		deleteChan:     deleteChan,
+		redownloadChan: redownloadChan,
+		msgChan:        make(chan *dbus.Message),
+		status:         "draft",
 	}
 	go msgInterface.watchDBusMethodCalls()
 	conn.RegisterObjectPath(msgInterface.objectPath, msgInterface.msgChan)
@@ -64,22 +66,35 @@ func (msgInterface *MessageInterface) Close() {
 }
 
 func (msgInterface *MessageInterface) watchDBusMethodCalls() {
+	log.Printf("jezek - msgInterface %v: watchDBusMethodCalls(): start", msgInterface.objectPath)
+	defer log.Printf("jezek - msgInterface %v: watchDBusMethodCalls(): end", msgInterface.objectPath)
 	var reply *dbus.Message
 
 	for msg := range msgInterface.msgChan {
+		log.Printf("jezek - msgInterface %v: Received message: %v", msgInterface.objectPath, msg)
 		if msg.Interface != MMS_MESSAGE_DBUS_IFACE {
+			//TODO:jezek Distinguish between this and next "Received unknown ..." error in log.
 			log.Println("Received unkown method call on", msg.Interface, msg.Member)
 			reply = dbus.NewErrorMessage(msg, "org.freedesktop.DBus.Error.UnknownMethod", "Unknown method")
+			//TODO:jezek Send the reply?
 			continue
 		}
 		switch msg.Member {
 		case "Delete":
+			//TODO:jezek - on some occasions (nuntium crash & restart) the telephony-service (or smthg. else) sends multiple read/delete requests. This crashes nuntium, when on first delete closing chanel whilst second del. req. is waiting in cannel.
 			reply = dbus.NewMethodReturnMessage(msg)
 			//TODO implement store and forward
 			if err := msgInterface.conn.Send(reply); err != nil {
 				log.Println("Could not send reply:", err)
 			}
 			msgInterface.deleteChan <- msgInterface.objectPath
+		case "Redownload":
+			reply = dbus.NewMethodReturnMessage(msg)
+			//TODO implement store and forward
+			if err := msgInterface.conn.Send(reply); err != nil {
+				log.Println("Could not send reply:", err)
+			}
+			msgInterface.redownloadChan <- msgInterface.objectPath
 		default:
 			log.Println("Received unkown method call on", msg.Interface, msg.Member)
 			reply = dbus.NewErrorMessage(msg, "org.freedesktop.DBus.Error.UnknownMethod", "Unknown method")
