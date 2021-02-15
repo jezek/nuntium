@@ -145,6 +145,7 @@ func (mediator *Mediator) handleMNotificationInd(pushMsg *ofono.PushPDU, modemId
 		log.Print("Received nil push")
 		return
 	}
+
 	dec := mms.NewDecoder(pushMsg.Data)
 	mNotificationInd := mms.NewMNotificationInd()
 	mNotificationInd.Received = time.Now()
@@ -152,6 +153,12 @@ func (mediator *Mediator) handleMNotificationInd(pushMsg *ofono.PushPDU, modemId
 		log.Println("Unable to decode m-notification.ind: ", err, "with log", dec.GetLog())
 		return
 	}
+
+	if !mNotificationInd.Expiry.IsValid() {
+		// If expiry time not valid, set default expiry 15 days.
+		mNotificationInd.Expiry = mms.Expiry{mms.ExpiryTokenRelative, 15 * 24 * 60 * 60}
+	}
+
 	storage.Create(modemId, mNotificationInd)
 	mediator.NewMNotificationInd <- mNotificationInd
 }
@@ -198,7 +205,7 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 		mmsContext, err = mediator.modem.ActivateMMSContext(preferredContext)
 		if err != nil {
 			log.Print("Cannot activate ofono context: ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-activate-context-error"}})
+			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-activate-context"}})
 			return
 		}
 		defer func() {
@@ -213,21 +220,20 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 		proxy, err = mmsContext.GetProxy()
 		if err != nil {
 			log.Print("Error retrieving proxy: ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-get-proxy-error"}})
+			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-get-proxy"}})
 			return
 		}
 	}
 
-	//TODO:jezek Downloader always downloads to same mms file(?) and then renames it in UpdateDownloaded. If there is concurency, will there be a problem?
 	// Download message content.
 	if filePath, err := mNotificationInd.DownloadContent(proxy.Host, int32(proxy.Port)); err != nil {
 		log.Print("Download issues: ", err)
-		mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-download-content-error"}})
+		mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-download-content"}})
 		return
 	} else {
 		if err := storage.UpdateDownloaded(mNotificationInd.UUID, filePath); err != nil {
 			log.Println("Error updating storage (UpdateDownloaded): ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-storage-error"})
+			mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-storage"})
 			return
 		}
 	}
@@ -237,7 +243,7 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 	mRetrieveConf, err := mediator.handleMRetrieveConf(mNotificationInd)
 	if err != nil {
 		log.Printf("Handling MRetrieveConf error: %v", err)
-		mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-forward-error"})
+		mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-forward"})
 		return
 	}
 	if err := storage.UpdateReceived(mRetrieveConf.UUID); err != nil {
@@ -406,6 +412,8 @@ func (mediator *Mediator) handleOutgoingMessage(msg *telepathy.OutgoingMessage) 
 
 func (mediator *Mediator) handleMSendReq(mSendReq *mms.MSendReq) {
 	log.Print("Encoding M-Send.Req")
+	//TODO:jezek - stoage is created, but it seems it is not deleted anywhere. Ensure deletion.
+	//TODO:jezek - on initialize, handle undeleted send messages (also add modem id and on init delete old stored messages).
 	f, err := storage.CreateSendFile(mSendReq.UUID)
 	if err != nil {
 		log.Print("Unable to create m-send.req file for ", mSendReq.UUID)
