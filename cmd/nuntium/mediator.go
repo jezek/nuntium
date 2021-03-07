@@ -85,12 +85,12 @@ mediatorLoop:
 				log.Print("MMS is disabled")
 				continue
 			}
-			go mediator.handleMNotificationInd(push, mediator.modem.Identity())
+			go mediator.handlePushAgentNotification(push, mediator.modem.Identity())
 		case mNotificationInd := <-mediator.NewMNotificationInd:
 			if deferredDownload {
 				go mediator.handleDeferredDownload(mNotificationInd)
 			} else {
-				go mediator.getMRetrieveConf(mNotificationInd)
+				go mediator.handleMNotificationInd(mNotificationInd)
 			}
 		case msg := <-mediator.outMessage:
 			go mediator.handleOutgoingMessage(msg)
@@ -140,7 +140,7 @@ mediatorLoop:
 	log.Print("Ending mediator instance loop for modem")
 }
 
-func (mediator *Mediator) handleMNotificationInd(pushMsg *ofono.PushPDU, modemId string) {
+func (mediator *Mediator) handlePushAgentNotification(pushMsg *ofono.PushPDU, modemId string) {
 	if pushMsg == nil {
 		log.Print("Received nil push")
 		return
@@ -202,7 +202,23 @@ type downloadError struct {
 
 func (e downloadError) AllowRedownload() bool { return true }
 
-func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationInd) {
+func (mediator *Mediator) activateMMSContext() (mmsContext ofono.OfonoContext, deactivationFunc func(), err error) {
+	log.Printf("jezek - mediator.activateMMSContext start")
+	preferredContext, _ := mediator.telepathyService.GetPreferredContext()
+	mmsContext, err = mediator.modem.ActivateMMSContext(preferredContext)
+	if err != nil {
+		return
+	}
+	deactivationFunc = func() {
+		log.Printf("jezek - mediator.deactivationFunc start")
+		if err := mediator.modem.DeactivateMMSContext(mmsContext); err != nil {
+			log.Println("Issues while deactivating context:", err)
+		}
+	}
+	return
+}
+
+func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotificationInd) {
 	mediator.contextLock.Lock()
 	defer mediator.contextLock.Unlock()
 
@@ -211,20 +227,17 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 	if mNotificationInd.IsLocal() {
 		log.Print("This is a local test, skipping context activation and proxy settings")
 	} else {
-		//TODO:jezek - encapsulate into deactivateFunc, err := activateMMSContext(...); defer deactivateFunc();
 		var err error
-		preferredContext, _ := mediator.telepathyService.GetPreferredContext()
-		mmsContext, err = mediator.modem.ActivateMMSContext(preferredContext)
+		var deactivateMMSContext func()
+		mmsContext, deactivateMMSContext, err = mediator.activateMMSContext()
 		if err != nil {
 			log.Print("Cannot activate ofono context: ", err)
 			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-activate-context"}})
 			return
 		}
-		defer func() {
-			if err := mediator.modem.DeactivateMMSContext(mmsContext); err != nil {
-				log.Println("Issues while deactivating context:", err)
-			}
-		}()
+		if deactivateMMSContext != nil {
+			defer deactivateMMSContext()
+		}
 
 		if err := mediator.telepathyService.SetPreferredContext(mmsContext.ObjectPath); err != nil {
 			log.Println("Unable to store the preferred context for MMS:", err)
@@ -243,6 +256,7 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 		mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-download-content"}})
 		return
 	} else {
+		// Save message to storage and update state to DOWNLOADED.
 		if err := storage.UpdateDownloaded(mNotificationInd.UUID, filePath); err != nil {
 			log.Println("Error updating storage (UpdateDownloaded): ", err)
 			mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-storage"})
@@ -250,14 +264,14 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 		}
 	}
 
-	//TODO:jezek - split handleMRetrieveConf into getMRetrieveConf & handle...
 	// Forward message to telepathy-ofono service.
-	mRetrieveConf, err := mediator.handleMRetrieveConf(mNotificationInd)
+	mRetrieveConf, err := mediator.getAndHandleMRetrieveConf(mNotificationInd)
 	if err != nil {
 		log.Printf("Handling MRetrieveConf error: %v", err)
 		mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-forward"})
 		return
 	}
+	// Update message state in storage to RECEIVED.
 	if err := storage.UpdateReceived(mRetrieveConf.UUID); err != nil {
 		log.Println("Error updating storage (UpdateRetrieved): ", err)
 		return
@@ -276,6 +290,7 @@ func (mediator *Mediator) getMRetrieveConf(mNotificationInd *mms.MNotificationIn
 		log.Print("This is a local test, skipping m-notifyresp.ind")
 	}
 	//TODO:jezek - Add storage states to docs graph file docs/assets/receiving_success_deferral_disabled.msc
+	// Update message state in storage to RESPONDED.
 	if err := storage.UpdateResponded(mNotifyRespInd.UUID); err != nil {
 		log.Println("Error updating storage (UpdateResponded): ", err)
 		return
@@ -315,11 +330,10 @@ func (mediator *Mediator) handleMRetrieveConfDownloadError(mNotificationInd *mms
 	}
 }
 
-func (mediator *Mediator) handleMRetrieveConf(mNotificationInd *mms.MNotificationInd) (*mms.MRetrieveConf, error) {
-	var filePath string
-	if f, err := storage.GetMMS(mNotificationInd.UUID); err == nil {
-		filePath = f
-	} else {
+// Decodes previously stored message (using UpdateDownloaded) to MRetrieveConf structure.
+func (mediator *Mediator) getMRetrieveConf(uuid string) (*mms.MRetrieveConf, error) {
+	filePath, err := storage.GetMMS(uuid)
+	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve MMS: %s", err)
 	}
 
@@ -328,10 +342,19 @@ func (mediator *Mediator) handleMRetrieveConf(mNotificationInd *mms.MNotificatio
 		return nil, fmt.Errorf("issues while reading from downloaded file: %s", err)
 	}
 
-	mRetrieveConf := mms.NewMRetrieveConf(mNotificationInd.UUID)
+	mRetrieveConf := mms.NewMRetrieveConf(uuid)
 	dec := mms.NewDecoder(mmsData)
 	if err := dec.Decode(mRetrieveConf); err != nil {
 		return nil, fmt.Errorf("unable to decode m-retrieve.conf: %s with log %s", err, dec.GetLog())
+	}
+
+	return mRetrieveConf, nil
+}
+
+func (mediator *Mediator) getAndHandleMRetrieveConf(mNotificationInd *mms.MNotificationInd) (*mms.MRetrieveConf, error) {
+	mRetrieveConf, err := mediator.getMRetrieveConf(mNotificationInd.UUID)
+	if err != nil {
+		return nil, err
 	}
 
 	if mediator.telepathyService == nil {
@@ -510,19 +533,15 @@ func (mediator *Mediator) uploadFile(filePath string) (string, error) {
 	mediator.contextLock.Lock()
 	defer mediator.contextLock.Unlock()
 
-	preferredContext, _ := mediator.telepathyService.GetPreferredContext()
-	mmsContext, err := mediator.modem.ActivateMMSContext(preferredContext)
+	mmsContext, deactivateMMSContext, err := mediator.activateMMSContext()
 	if err != nil {
 		return "", err
 	}
+	defer deactivateMMSContext()
+
 	if err := mediator.telepathyService.SetPreferredContext(mmsContext.ObjectPath); err != nil {
 		log.Println("Unable to store the preferred context for MMS:", err)
 	}
-	defer func() {
-		if err := mediator.modem.DeactivateMMSContext(mmsContext); err != nil {
-			log.Println("Issues while deactivating context:", err)
-		}
-	}()
 
 	proxy, err := mmsContext.GetProxy()
 	if err != nil {
