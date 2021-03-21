@@ -98,11 +98,34 @@ func CreateResponseFile(uuid string) (*os.File, error) {
 	return os.Create(filePath)
 }
 
+func UpdateMNotificationInd(mNotificationInd *mms.MNotificationInd) error {
+	log.Printf("jezek - UpdateMNotificationInd(%v)", mNotificationInd)
+	state, err := GetMMSState(mNotificationInd.UUID)
+	if err != nil {
+		return fmt.Errorf("error retrieving message state: %w", err)
+	}
+
+	state.MNotificationInd = mNotificationInd
+
+	storePath, err := xdg.Data.Find(path.Join(SUBPATH, mNotificationInd.UUID+".db"))
+	if err != nil {
+		return err
+	}
+	return writeState(state, storePath)
+}
+
 func UpdateDownloaded(uuid, filePath string) error {
 	log.Printf("jezek - UpdateDownloaded(%s, %s)", uuid, filePath)
 	state, err := GetMMSState(uuid)
 	if err != nil {
 		return fmt.Errorf("error retrieving message state: %w", err)
+	}
+
+	// Debug error forcing if wanted.
+	if err := state.MNotificationInd.PopDebugError(mms.DebugErrorDownloadStorage); err != nil {
+		log.Printf("Forcing debug error: %#v", err)
+		UpdateMNotificationInd(state.MNotificationInd)
+		return err
 	}
 
 	// Move downloaded file (filePath) to xdg data storage.
@@ -130,6 +153,13 @@ func UpdateReceived(uuid string) error {
 		return fmt.Errorf("error retrieving message state: %w", err)
 	}
 
+	// Debug error forcing if wanted.
+	if err := state.MNotificationInd.PopDebugError(mms.DebugErrorReceiveStorage); err != nil {
+		log.Printf("Forcing debug error: %#v", err)
+		UpdateMNotificationInd(state.MNotificationInd)
+		return err
+	}
+
 	state.State = RECEIVED
 	state.TelepathyNotified = true
 
@@ -144,6 +174,13 @@ func UpdateResponded(uuid string) error {
 	state, err := GetMMSState(uuid)
 	if err != nil {
 		return fmt.Errorf("error retrieving message state: %w", err)
+	}
+
+	// Debug error forcing if wanted.
+	if err := state.MNotificationInd.PopDebugError(mms.DebugErrorRespondStorage); err != nil {
+		log.Printf("Forcing debug error: %#v", err)
+		UpdateMNotificationInd(state.MNotificationInd)
+		return err
 	}
 
 	state.State = RESPONDED

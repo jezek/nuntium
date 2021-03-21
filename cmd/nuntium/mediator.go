@@ -189,19 +189,6 @@ func (mediator *Mediator) handleDeferredDownload(mNotificationInd *mms.MNotifica
 
 }
 
-type standartizedError struct {
-	error
-	code string
-}
-
-func (e standartizedError) Code() string { return e.code }
-
-type downloadError struct {
-	standartizedError
-}
-
-func (e downloadError) AllowRedownload() bool { return true }
-
 func (mediator *Mediator) activateMMSContext() (mmsContext ofono.OfonoContext, deactivationFunc func(), err error) {
 	log.Printf("jezek - mediator.activateMMSContext start")
 	preferredContext, _ := mediator.telepathyService.GetPreferredContext()
@@ -218,6 +205,16 @@ func (mediator *Mediator) activateMMSContext() (mmsContext ofono.OfonoContext, d
 	return
 }
 
+func (mediator *Mediator) debugMMSContextError(mNotificationInd *mms.MNotificationInd) error {
+	if err := mNotificationInd.PopDebugError(mms.DebugErrorActivateContext); err != nil {
+		return downloadError{standartizedError{err, ErrorActivateContext}}
+	} else if err := mNotificationInd.PopDebugError(mms.DebugErrorGetProxy); err != nil {
+		return downloadError{standartizedError{err, ErrorGetProxy}}
+	}
+
+	return nil
+}
+
 func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotificationInd) {
 	mediator.contextLock.Lock()
 	defer mediator.contextLock.Unlock()
@@ -226,13 +223,19 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 	var mmsContext ofono.OfonoContext
 	if mNotificationInd.IsDebug() {
 		log.Print("This is a local test, skipping context activation and proxy settings")
+		if err := mediator.debugMMSContextError(mNotificationInd); err != nil {
+			log.Printf("Forcing debug error: %#v", err)
+			storage.UpdateMNotificationInd(mNotificationInd)
+			mediator.handleMessageDownloadError(mNotificationInd, err)
+			return
+		}
 	} else {
 		var err error
 		var deactivateMMSContext func()
 		mmsContext, deactivateMMSContext, err = mediator.activateMMSContext()
 		if err != nil {
 			log.Print("Cannot activate ofono context: ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-activate-context"}})
+			mediator.handleMessageDownloadError(mNotificationInd, downloadError{standartizedError{err, ErrorActivateContext}})
 			return
 		}
 		if deactivateMMSContext != nil {
@@ -245,7 +248,7 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 		proxy, err = mmsContext.GetProxy()
 		if err != nil {
 			log.Print("Error retrieving proxy: ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-get-proxy"}})
+			mediator.handleMessageDownloadError(mNotificationInd, downloadError{standartizedError{err, ErrorGetProxy}})
 			return
 		}
 	}
@@ -253,13 +256,13 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 	// Download message content.
 	if filePath, err := mNotificationInd.DownloadContent(proxy.Host, int32(proxy.Port)); err != nil {
 		log.Print("Download issues: ", err)
-		mediator.handleMRetrieveConfDownloadError(mNotificationInd, downloadError{standartizedError{err, "x-ubports-nuntium-mms-error-download-content"}})
+		mediator.handleMessageDownloadError(mNotificationInd, downloadError{standartizedError{err, ErrorDownloadContent}})
 		return
 	} else {
 		// Save message to storage and update state to DOWNLOADED.
 		if err := storage.UpdateDownloaded(mNotificationInd.UUID, filePath); err != nil {
 			log.Println("Error updating storage (UpdateDownloaded): ", err)
-			mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-storage"})
+			mediator.handleMessageDownloadError(mNotificationInd, standartizedError{err, ErrorStorage})
 			return
 		}
 	}
@@ -268,7 +271,7 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 	mRetrieveConf, err := mediator.getAndHandleMRetrieveConf(mNotificationInd)
 	if err != nil {
 		log.Printf("Handling MRetrieveConf error: %v", err)
-		mediator.handleMRetrieveConfDownloadError(mNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-forward"})
+		mediator.handleMessageDownloadError(mNotificationInd, standartizedError{err, ErrorForward})
 		return
 	}
 	// Update message state in storage to RECEIVED.
@@ -291,6 +294,11 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 		}
 	} else {
 		log.Print("This is a local test, skipping m-notifyresp.ind")
+		if err := mNotificationInd.PopDebugError(mms.DebugErrorRespondHandle); err != nil {
+			log.Printf("Forcing debug error: %#v", err)
+			storage.UpdateMNotificationInd(mNotificationInd)
+			return
+		}
 	}
 	// MMS center is notified, that the message was downloaded, we can remove the TransactionId from undownloaded.
 	delete(mediator.undownloaded, mNotificationInd.TransactionId)
@@ -304,9 +312,10 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 
 // Communicates the download error "err" of mNotificationInd to telepathy service.
 // Some operators repeatedly push mNotificationInd with the same transaction id, if download not acknowledged by mNotifyRespInd. So we have to make sure, to communicate the download error just once.
-func (mediator *Mediator) handleMRetrieveConfDownloadError(mNotificationInd *mms.MNotificationInd, err error) {
+func (mediator *Mediator) handleMessageDownloadError(mNotificationInd *mms.MNotificationInd, err error) {
 	_, inUndownloaded := mediator.undownloaded[mNotificationInd.TransactionId]
 	if mNotificationInd.RedownloadOfUUID == "" && inUndownloaded && mNotificationInd.TransactionId != "" {
+		//TODO:jezek - look for mmsState.TelepathyNotified.
 		// This download error "err" happened not after redownload and not after first download fail of pushed mNotificationInd with the same transaction id.
 		log.Printf("Download error for MNotificationInd with TransactionId: \"%s\" was already communicated by UUID: \"%s\"", mNotificationInd.TransactionId, mediator.undownloaded[mNotificationInd.TransactionId])
 		// Delete the message from storage.
@@ -358,6 +367,11 @@ func (mediator *Mediator) getMRetrieveConf(uuid string) (*mms.MRetrieveConf, err
 }
 
 func (mediator *Mediator) getAndHandleMRetrieveConf(mNotificationInd *mms.MNotificationInd) (*mms.MRetrieveConf, error) {
+	if err := mNotificationInd.PopDebugError(mms.DebugErrorReceiveHandle); err != nil {
+		log.Printf("Forcing getAndHandleMRetrieveConf debug error: %#v", err)
+		storage.UpdateMNotificationInd(mNotificationInd)
+		return nil, err
+	}
 	mRetrieveConf, err := mediator.getMRetrieveConf(mNotificationInd.UUID)
 	if err != nil {
 		return nil, err
@@ -669,7 +683,7 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 			if mmsState.TelepathyNotified == false { // Telepathy service wasn't notified of the download error.
 				// Try to notify now (for now, lets pretend it was an activation error).
 				//TODO:jezek - Store error and notify with it.
-				if addErr := mediator.telepathyService.IncomingMessageFailAdded(mmsState.MNotificationInd, downloadError{standartizedError{fmt.Errorf("Made-up error on initialization, cause we forgot, what the error was"), "x-ubports-nuntium-error-activate-context"}}); addErr != nil {
+				if addErr := mediator.telepathyService.IncomingMessageFailAdded(mmsState.MNotificationInd, downloadError{standartizedError{fmt.Errorf("Made-up error on initialization, cause we forgot, what the error was"), ErrorActivateContext}}); addErr != nil {
 					// Couldn't inform telepathy about download fail.
 					log.Printf("Sending download error message to telepathy has failed with error: %v", addErr)
 				} else {
@@ -714,7 +728,7 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 				mRetrieveConf, err := mediator.getAndHandleMRetrieveConf(mmsState.MNotificationInd)
 				if err != nil {
 					log.Printf("Handling MRetrieveConf error: %v", err)
-					mediator.handleMRetrieveConfDownloadError(mmsState.MNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-forward"})
+					mediator.handleMessageDownloadError(mmsState.MNotificationInd, standartizedError{err, "x-ubports-nuntium-mms-error-forward"})
 				} else {
 					// Update message state in storage to RECEIVED.
 					//TODO:jezek - should return mmsState.
@@ -786,6 +800,11 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 					}
 				} else {
 					log.Print("This is a local test, skipping m-notifyresp.ind")
+					if err := mmsState.MNotificationInd.PopDebugError(mms.DebugErrorRespondHandle); err != nil {
+						log.Printf("Forcing debug error: %#v", err)
+						storage.UpdateMNotificationInd(mmsState.MNotificationInd)
+						return err
+					}
 				}
 				return nil
 			}(); err != nil {
