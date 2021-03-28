@@ -29,7 +29,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/ubports/nuntium/mms"
 	"launchpad.net/go-xdg/v0"
@@ -161,7 +164,6 @@ func UpdateReceived(uuid string) error {
 	}
 
 	state.State = RECEIVED
-	state.TelepathyNotified = true
 
 	storePath, err := xdg.Data.Find(path.Join(SUBPATH, uuid+".db"))
 	if err != nil {
@@ -192,13 +194,13 @@ func UpdateResponded(uuid string) error {
 	return writeState(state, storePath)
 }
 
-func UpdateTelepathyNotified(uuid string) error {
+func SetTelepathyErrorNotified(uuid string) error {
 	state, err := GetMMSState(uuid)
 	if err != nil {
 		return fmt.Errorf("error retrieving message state: %w", err)
 	}
 
-	state.TelepathyNotified = true
+	state.TelepathyErrorNotified = true
 
 	storePath, err := xdg.Data.Find(path.Join(SUBPATH, uuid+".db"))
 	if err != nil {
@@ -286,7 +288,8 @@ func writeState(state MMSState, storePath string) error {
 	return nil
 }
 
-// Returns list of UUID strings stored in storage.
+// Returns list of UUID strings stored in storage, sorted by creation date.
+// Note: If creation date is not supported by filesystem, UUIDs are sorted by modificatin date.
 func GetStoredUUIDs() []string {
 	// Search for all *.db files in xdg data directory in SUBPATH subfolder and extract UUID from filenames.
 
@@ -296,7 +299,10 @@ func GetStoredUUIDs() []string {
 		return nil
 	}
 
-	uuids := make([]string, 0)
+	uuidsWithTime := make([]struct {
+		uuid  string
+		ctime time.Time
+	}, 0) // For sorting.
 	err = filepath.Walk(storeDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -307,7 +313,17 @@ func GetStoredUUIDs() []string {
 		if matched, err := filepath.Match("*.db", filepath.Base(path)); err != nil {
 			return err
 		} else if matched {
-			uuids = append(uuids, strings.TrimSuffix(filepath.Base(path), ".db"))
+			ctime := info.ModTime()
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+				ctime = time.Unix(stat.Ctim.Unix())
+			}
+			uuidsWithTime = append(uuidsWithTime, struct {
+				uuid  string
+				ctime time.Time
+			}{
+				strings.TrimSuffix(filepath.Base(path), ".db"),
+				ctime,
+			})
 		}
 		return nil
 	})
@@ -315,5 +331,13 @@ func GetStoredUUIDs() []string {
 		return nil
 	}
 
+	// Sort uuids by cdates ascending.
+	sort.SliceStable(uuidsWithTime, func(i, j int) bool {
+		return uuidsWithTime[i].ctime.Before(uuidsWithTime[j].ctime)
+	})
+	uuids := make([]string, len(uuidsWithTime))
+	for i, uuidWithTime := range uuidsWithTime {
+		uuids[i] = uuidWithTime.uuid
+	}
 	return uuids
 }

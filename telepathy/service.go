@@ -117,7 +117,7 @@ func (*MMSService) getMMSState(objectPath dbus.ObjectPath) (storage.MMSState, er
 
 func (service *MMSService) watchMessageDeleteCalls() {
 	for msgObjectPath := range service.msgDeleteChan {
-		log.Printf("jezek - MMSService.watchMessageDeleteCalls: msgObjectPath: %v", msgObjectPath)
+		log.Printf("jezek - MMS delete call: %v", msgObjectPath)
 
 		if mmsState, err := service.getMMSState(msgObjectPath); err == nil {
 			if mmsState.State != storage.RESPONDED && mmsState.MNotificationInd != nil && !mmsState.MNotificationInd.Expired() {
@@ -136,7 +136,7 @@ func (service *MMSService) watchMessageDeleteCalls() {
 
 func (service *MMSService) watchMessageRedownloadCalls() {
 	for msgObjectPath := range service.msgRedownloadChan {
-		log.Printf("jezek - MMSService.watchMessageRedownloadCalls: msgObjectPath: %v", msgObjectPath)
+		log.Printf("jezek - MMS redownload call: %v", msgObjectPath)
 
 		mmsState, err := service.getMMSState(msgObjectPath)
 		if err != nil {
@@ -151,7 +151,7 @@ func (service *MMSService) watchMessageRedownloadCalls() {
 			log.Printf("Redownload of %s error: no mNotificationInd found", string(msgObjectPath))
 			continue
 		}
-		log.Printf("jezek - MMSService.watchMessageRedownloadCalls: mNotificationInd: %#v", mmsState.MNotificationInd)
+		log.Printf("jezek - mNotificationInd old: %#v", mmsState.MNotificationInd)
 
 		// Stop previous message handling, remove and notify.
 		if err := service.MessageRemoved(msgObjectPath); err != nil {
@@ -163,16 +163,16 @@ func (service *MMSService) watchMessageRedownloadCalls() {
 		newMNotificationInd.RedownloadOfUUID = mmsState.MNotificationInd.UUID
 		newMNotificationInd.UUID = mms.GenUUID()
 		storage.Create(mmsState.ModemId, newMNotificationInd)
-		log.Printf("jezek - MMSService.watchMessageRedownloadCalls: new mNotificationInd new: %#v", newMNotificationInd)
+		log.Printf("jezek - mNotificationInd new: %#v", newMNotificationInd)
 		service.mNotificationIndChan <- newMNotificationInd
 	}
 }
 
 func (service *MMSService) watchDBusMethodCalls() {
-	log.Printf("jezek - service %v: watchDBusMethodCalls(): start", service.identity)
-	defer log.Printf("jezek - service %v: watchDBusMethodCalls(): end", service.identity)
+	log.Printf("jezek - MMS %v: watchDBusMethodCalls(): start", service.identity)
+	defer log.Printf("jezek - MMS %v: watchDBusMethodCalls(): end", service.identity)
 	for msg := range service.msgChan {
-		log.Printf("jezek - service %v: watchDBusMethodCalls(): Received message: %s - %v", service.identity, msg.Member, msg)
+		log.Printf("jezek - MMS %v: dbus message: %s - %v", service.identity, msg.Member, msg)
 		var reply *dbus.Message
 		if msg.Interface != MMS_SERVICE_DBUS_IFACE {
 			log.Println("Received unknown interface call on", msg.Interface, msg.Member)
@@ -346,7 +346,13 @@ func (service *MMSService) IncomingMessageFailAdded(mNotificationInd *mms.MNotif
 	if service == nil {
 		return fmt.Errorf("Nil MMSService")
 	}
-	//just handle that mms as an empty MMS
+
+	if err := mNotificationInd.PopDebugError(mms.DebugErrorTelepathyErrorNotify); err != nil {
+		log.Printf("Forcing IncomingMessageFailAdded debug error: %#v", err)
+		storage.UpdateMNotificationInd(mNotificationInd)
+		return err
+	}
+
 	params := make(map[string]dbus.Variant)
 
 	//TODO:jezek - delete or write somewhere
@@ -388,9 +394,10 @@ func (service *MMSService) IncomingMessageFailAdded(mNotificationInd *mms.MNotif
 
 	var mobileData *bool
 	if enabled, err := service.MobileDataEnabled(); err == nil {
+		log.Printf("jezek - MobileDataEnabled(): %v", enabled)
 		mobileData = &enabled
 	} else {
-		log.Printf("Error detecting mobile data enabled: %v", err)
+		log.Printf("Error detecting if mobile data is enabled: %v", err)
 	}
 
 	errorMessage, err := json.Marshal(&struct {
@@ -421,7 +428,6 @@ func (service *MMSService) IncomingMessageFailAdded(mNotificationInd *mms.MNotif
 	if !allowRedownload {
 		redownloadChan = nil
 	}
-	//TODO:jezek - add debug error telepathy notify.
 	service.messageHandlers[payload.Path] = NewMessageInterface(service.conn, payload.Path, service.msgDeleteChan, redownloadChan)
 	//TODO:issue - if error encountered, you can stop handling message.
 	return service.MessageAdded(&payload)
@@ -433,6 +439,12 @@ func (service *MMSService) IncomingMessageFailAdded(mNotificationInd *mms.MNotif
 func (service *MMSService) IncomingMessageAdded(mRetConf *mms.MRetrieveConf, mNotificationInd *mms.MNotificationInd) error {
 	if service == nil {
 		return ErrorNilMMSService
+	}
+
+	if err := mNotificationInd.PopDebugError(mms.DebugErrorReceiveHandle); err != nil {
+		log.Printf("Forcing getAndHandleMRetrieveConf debug error: %#v", err)
+		storage.UpdateMNotificationInd(mNotificationInd)
+		return err
 	}
 
 	payload, err := service.parseMessage(mRetConf)
@@ -447,7 +459,6 @@ func (service *MMSService) IncomingMessageAdded(mRetConf *mms.MRetrieveConf, mNo
 		payload.Properties["Received"] = dbus.Variant{mNotificationInd.Received.Unix()}
 	}
 
-	//TODO:jezek - add debug error telepathy notify.
 	service.messageHandlers[payload.Path] = NewMessageInterface(service.conn, payload.Path, service.msgDeleteChan, nil)
 	//TODO:issue - if error encountered, you can stop handling message.
 	return service.MessageAdded(&payload)
@@ -607,7 +618,6 @@ func (service *MMSService) MessageHandle(uuid string, allowRedownload bool) erro
 // string:com.ubuntu.connectivity1.Private \
 // 	string:'MobileDataEnabled'
 func (service *MMSService) MobileDataEnabled() (bool, error) {
-	log.Printf("jezek - MobileDataEnabled()")
 	call := dbus.NewMethodCallMessage("com.ubuntu.connectivity1", "/com/ubuntu/connectivity1/Private", "org.freedesktop.DBus.Properties", "Get")
 	call.AppendArgs("com.ubuntu.connectivity1.Private", "MobileDataEnabled")
 	reply, err := service.conn.SendWithReply(call)
