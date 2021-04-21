@@ -746,6 +746,7 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 		}
 
 		startTelepathyHandlers := false
+		checkInHistoryService := true
 		switch mmsState.State {
 		case storage.NOTIFICATION:
 			// Message download failed, error was probably communicated to telepathy.
@@ -762,6 +763,7 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 					// Message is expired (and was deleted from storage), don't continue.
 					// Remove from unrespondedTransactions.
 					delete(mediator.unrespondedTransactions, mmsState.MNotificationInd.TransactionId)
+					log.Printf("jezek - remove message from unresponded")
 					break
 				}
 
@@ -784,6 +786,8 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 				} else {
 					// Message was forwarded to telepathy and state in storage was updated.
 					forwardedUpdated = true
+					// If this message falls through to RESPONDED, don't check if message is in history service, cause it probably hasn't arrived there yet.
+					checkInHistoryService = false
 				}
 			}
 
@@ -827,33 +831,36 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 
 			// Remove from unrespondedTransactions.
 			delete(mediator.unrespondedTransactions, mmsState.MNotificationInd.TransactionId)
+			log.Printf("jezek - remove message from unresponded")
 
-			// Get message from history service and if read or not exist, delete and don't spawn handlers.
-			eventId := string(mediator.telepathyService.GenMessagePath(uuid))
-			hsMessage, err := historyService.GetMessage(eventId)
-			if err != nil {
-				log.Printf("Error getting message %s from HistoryService: %v", eventId, err)
-			} else {
-				log.Printf("jezek - hsMessage: %v", hsMessage)
+			if checkInHistoryService {
+				// Get message from history service and if read or not exist, delete and don't spawn handlers.
+				eventId := string(mediator.telepathyService.GenMessagePath(uuid))
+				hsMessage, err := historyService.GetMessage(eventId)
+				if err != nil {
+					log.Printf("Error getting message %s from HistoryService: %v", eventId, err)
+				} else {
+					log.Printf("jezek - hsMessage: %v", hsMessage)
 
-				// If message is doesn't exist, break (don't spawn handlers).
-				if !hsMessage.Exists() {
-					log.Printf("Message %s doesn't exist in HistoryService, no need to store, deleting.", uuid)
-					if err := storage.Destroy(uuid); err != nil {
-						log.Printf("Error destroying message: %v", err)
+					// If message is doesn't exist, break (don't spawn handlers).
+					if !hsMessage.Exists() {
+						log.Printf("Message %s doesn't exist in HistoryService, no need to store, deleting.", uuid)
+						if err := storage.Destroy(uuid); err != nil {
+							log.Printf("Error destroying message: %v", err)
+						}
+						break
 					}
-					break
-				}
 
-				// If message is marked as read (is not new), break (don't spawn handlers).
-				if isnew, err := hsMessage.IsNew(); err != nil {
-					log.Printf("Error checking if message is new in HistoryService: %s", err)
-				} else if isnew == false {
-					log.Printf("Message %s is marked as read in HistoryService, no need to store, deleting.", uuid)
-					if err := storage.Destroy(uuid); err != nil {
-						log.Printf("Error destroying message: %v", err)
+					// If message is marked as read (is not new), break (don't spawn handlers).
+					if isnew, err := hsMessage.IsNew(); err != nil {
+						log.Printf("Error checking if message is new in HistoryService: %s", err)
+					} else if isnew == false {
+						log.Printf("Message %s is marked as read in HistoryService, no need to store, deleting.", uuid)
+						if err := storage.Destroy(uuid); err != nil {
+							log.Printf("Error destroying message: %v", err)
+						}
+						break
 					}
-					break
 				}
 			}
 
@@ -865,17 +872,9 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 		}
 
 		if startTelepathyHandlers {
-			// Spawn interface listener to listen for redownload requests.
-			log.Printf("jezek - spawning handlers for message")
-			if err := mediator.telepathyService.MessageHandle(uuid, true); err != nil {
-				log.Printf("Error starting message %s handlers of message with state %v", uuid, mmsState.State)
-				continue
-			}
-
-			log.Printf("jezek - sending telepathy handle request for message")
 			mRetrieveConf, _ := mediator.getMRetrieveConf(uuid)
-			if err := mediator.telepathyService.MessageHandleRequest(mRetrieveConf, mmsState.MNotificationInd); err != nil {
-				log.Printf("Error requesting telepathy message %s handlers of message with state %v", uuid, mmsState.State)
+			if err := mediator.telepathyService.InitializationMessageAdded(mRetrieveConf, mmsState.MNotificationInd); err != nil {
+				log.Printf("Error adding initialization message for message %s: %v", uuid, err)
 			}
 		}
 	}
