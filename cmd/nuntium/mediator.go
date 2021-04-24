@@ -158,7 +158,6 @@ func (mediator *Mediator) handlePushAgentNotification(pushMsg *ofono.PushPDU, mo
 		if uuid, ok := mediator.unrespondedTransactions[mNotificationInd.TransactionId]; ok {
 			log.Printf("Pushed transaction ID (%s) is in undownloaded pointing to UUID: %s", mNotificationInd.TransactionId, uuid)
 			if st, err := storage.GetMMSState(uuid); err == nil {
-				log.Printf("jezek - mmsState: %v", st)
 				if st.MNotificationInd != nil {
 					log.Printf("Changing recieved date to the first push date: %v", st.MNotificationInd.Received)
 					mNotificationInd.Received = st.MNotificationInd.Received
@@ -190,14 +189,12 @@ func (mediator *Mediator) handleDeferredDownload(mNotificationInd *mms.MNotifica
 }
 
 func (mediator *Mediator) activateMMSContext() (mmsContext ofono.OfonoContext, deactivationFunc func(), err error) {
-	log.Printf("jezek - mediator.activateMMSContext start")
 	preferredContext, _ := mediator.telepathyService.GetPreferredContext()
 	mmsContext, err = mediator.modem.ActivateMMSContext(preferredContext)
 	if err != nil {
 		return
 	}
 	deactivationFunc = func() {
-		log.Printf("jezek - mediator.deactivationFunc start")
 		if err := mediator.modem.DeactivateMMSContext(mmsContext); err != nil {
 			log.Println("Issues while deactivating context:", err)
 		}
@@ -321,7 +318,6 @@ func (mediator *Mediator) handleMNotificationInd(mNotificationInd *mms.MNotifica
 		log.Println("Error updating storage (UpdateResponded): ", err)
 		return
 	}
-	//TODO:jezek - Add storage states to docs graph file docs/assets/receiving_success_deferral_disabled.msc
 }
 
 // Communicates the download error "err" of mNotificationInd to telepathy service.
@@ -524,8 +520,6 @@ func (mediator *Mediator) handleOutgoingMessage(msg *telepathy.OutgoingMessage) 
 
 func (mediator *Mediator) handleMSendReq(mSendReq *mms.MSendReq) {
 	log.Print("Encoding M-Send.Req")
-	//TODO:issue - storage is created, but it seems it is not deleted anywhere. Ensure deletion.
-	//TODO:issue - on initialize, handle undeleted send messages (also add modem id and on init delete old stored messages).
 	f, err := storage.CreateSendFile(mSendReq.UUID)
 	if err != nil {
 		log.Print("Unable to create m-send.req file for ", mSendReq.UUID)
@@ -665,14 +659,11 @@ func mmsEnabled() bool {
 }
 
 func (mediator *Mediator) initializeMessages(modemId string) {
-	log.Printf("jezek - Mediator.initializeMessages(%s): start", modemId)
-	defer log.Printf("jezek - Mediator.initializeMessages(%s): end", modemId)
 	historyService := mediator.telepathyService.HistoryService()
 	handledTransactions := map[string]string{}
 	uuids := storage.GetStoredUUIDs()
-	log.Printf("Found %d messages in storage", len(uuids))
+	log.Printf("Initializing %d messages from storage", len(uuids))
 	for _, uuid := range uuids {
-		log.Printf("jezek - checking uuid: %s", uuid)
 		mmsState, err := storage.GetMMSState(uuid)
 		if err != nil {
 			log.Printf("Error checking state of message stored under UUID: %s : %v", uuid, err)
@@ -681,7 +672,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 			}
 			continue
 		}
-		log.Printf("jezek - %#v", mmsState)
 
 		if !mmsState.IsIncoming() {
 			log.Printf("Message %s is not an incoming message. State: %s", uuid, mmsState.State)
@@ -698,7 +688,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 		}
 
 		if modemId != mmsState.ModemId {
-			log.Printf("jezek - message modem id (%s) doesn't match added modem (%s)", mmsState.ModemId, modemId)
 			continue
 		}
 		// Just log any irregularities here.
@@ -726,7 +715,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 			handledTransactions[mmsState.MNotificationInd.TransactionId] = uuid
 			// Add to unresponded, to not communicate possible error to telepathy again, on possible message notification from MMS center.
 			mediator.unrespondedTransactions[mmsState.MNotificationInd.TransactionId] = uuid
-			log.Printf("jezek - added message to unresponded")
 		}
 
 		checkExpiredAndHandle := func() bool {
@@ -734,7 +722,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 				return false
 			}
 
-			log.Printf("jezek - mNotificationInd is expired")
 			// MNotificationInd is expired, destroy in storage & notify telepathy service.
 			if err := storage.Destroy(uuid); err != nil {
 				log.Printf("Error destroying expired message: %v", err)
@@ -763,7 +750,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 					// Message is expired (and was deleted from storage), don't continue.
 					// Remove from unrespondedTransactions.
 					delete(mediator.unrespondedTransactions, mmsState.MNotificationInd.TransactionId)
-					log.Printf("jezek - remove message from unresponded")
 					break
 				}
 
@@ -831,7 +817,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 
 			// Remove from unrespondedTransactions.
 			delete(mediator.unrespondedTransactions, mmsState.MNotificationInd.TransactionId)
-			log.Printf("jezek - remove message from unresponded")
 
 			if checkInHistoryService {
 				// Get message from history service and if read or not exist, delete and don't spawn handlers.
@@ -840,8 +825,6 @@ func (mediator *Mediator) initializeMessages(modemId string) {
 				if err != nil {
 					log.Printf("Error getting message %s from HistoryService: %v", eventId, err)
 				} else {
-					log.Printf("jezek - hsMessage: %v", hsMessage)
-
 					// If message is doesn't exist, break (don't spawn handlers).
 					if !hsMessage.Exists() {
 						log.Printf("Message %s doesn't exist in HistoryService, no need to store, deleting.", uuid)
@@ -886,7 +869,6 @@ func (mediator *Mediator) respondMessage(mmsState storage.MMSState) error {
 	mediator.contextLock.Lock()
 	defer mediator.contextLock.Unlock()
 
-	//TODO:issue - check if data enabled and if not, return error.
 	mRetrieveConf, err := mediator.getMRetrieveConf(mmsState.MNotificationInd.UUID)
 	if err != nil {
 		return err
